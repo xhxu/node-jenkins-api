@@ -7,6 +7,7 @@ const request = require('request');
 const API = '/api/json';
 const LIST = API;
 const CREATE = `/createItem${API}`;
+const CRUMB_ISSUER_URL = `/crumbIssuer${API}`;
 
 const BUILD_START = `/job/%s/build${API}`;
 const BUILD_START_WITHPARAMS = '/job/%s/buildWithParameters'; // TODO how to handle this?
@@ -67,7 +68,6 @@ function getType(value) {
     return 'null';
   }
   return typeof value;
-
 }
 
 /**
@@ -138,7 +138,11 @@ function doArgs(values, types) {
  * @param {function} callback function to call when all done
  */
 function tryParseJson(body, property, callback) {
-  [body, property, callback] = doArgs(arguments, ['string', 'string|array|function|null', 'function']);
+  [body, property, callback] = doArgs(arguments, [
+    'string',
+    'string|array|function|null',
+    'function'
+  ]);
 
   try {
     // Won't harm if we replace escape sequence
@@ -172,7 +176,6 @@ function tryParseJson(body, property, callback) {
     callback(e, body);
   }
 }
-
 
 // -----------------------------------------------------------------------------
 
@@ -209,7 +212,7 @@ exports.init = function (host, defaultOptions, defaultParams) {
     }
 
     // Does url contain parameters already?
-    const delim = (url.includes('?') ? '&' : '?');
+    const delim = url.includes('?') ? '&' : '?';
 
     return url + delim + paramsString;
   };
@@ -228,6 +231,43 @@ exports.init = function (host, defaultOptions, defaultParams) {
     return url;
   }
 
+  // get crumb config
+  const getCrumb = function (requestOptions, callback) {
+    const urlPattern = [CRUMB_ISSUER_URL];
+    const url = formatUrl.apply(null, urlPattern);
+
+    if (
+      requestOptions.method !== 'POST'
+      && requestOptions.method !== 'DELETE'
+    ) {
+      return callback();
+    }
+
+    const getCrumbOptions = Object.assign(
+      {
+        method: 'GET',
+        url: url,
+        headers: [],
+        followAllRedirects: true
+      },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    request(getCrumbOptions, function (error, response, body) {
+      response = response.toJSON();
+      if (error || response.statusCode !== HTTP_CODE_200) {
+        return callback(null);
+      }
+      const getCrumbResponse = JSON.parse(body);
+      const crumb = {};
+
+      crumb[getCrumbResponse.crumbRequestField] = getCrumbResponse.crumb;
+      crumb.cookie = response.headers['set-cookie'][0];
+
+      callback(null, crumb);
+    });
+  };
+
   /**
    * Run the actual HTTP request.
    *
@@ -236,64 +276,89 @@ exports.init = function (host, defaultOptions, defaultParams) {
    * @param {function} callback - the callback function to be called when request is finished.
    */
   const doRequest = function (specificOptions, customParams, callback) {
-
     // Options - Default values
-    const options = Object.assign({}, {
-      urlPattern: ['/'],
-      method: 'GET',
-      successStatusCodes: [HTTP_CODE_200],
-      failureStatusCodes: [],
-      bodyProp: null,
-      noparse: false,
-      request: {}
-    }, defaultOptions, specificOptions);
+    const options = Object.assign(
+      {},
+      {
+        urlPattern: ['/'],
+        method: 'GET',
+        successStatusCodes: [HTTP_CODE_200],
+        failureStatusCodes: [],
+        bodyProp: null,
+        noparse: false,
+        request: {}
+      },
+      defaultOptions,
+      specificOptions
+    );
 
     // Create the url
     const url = buildUrl(options.urlPattern, customParams);
 
     // Build the actual request options
-    const requestOptions = Object.assign({
-      method: options.method,
-      url: url,
-      headers: [],
-      followAllRedirects: true,
-      form: null,
-      body: null
-    }, options.request);
+    const requestOptions = Object.assign(
+      {
+        method: options.method,
+        url: url,
+        headers: [],
+        followAllRedirects: true,
+        form: null,
+        body: null
+      },
+      options.request
+    );
 
-    // Do the request
-    request(requestOptions, function (error, response, body) {
-      if (error) {
-        callback(error, response);
+    getCrumb(requestOptions, function (err, crumb) {
+      if (err) {
+        callback(err, crumb);
         return;
       }
-
-      if ((Array.isArray(options.successStatusCodes) && !options.successStatusCodes.includes(response.statusCode))
-        || (Array.isArray(options.failureStatusCodes) && options.failureStatusCodes.includes(response.statusCode))) {
-        callback(`Server returned unexpected status code: ${response.statusCode}`, response);
-        return;
+      if (crumb) {
+        Object.assign(requestOptions.headers, crumb);
       }
 
-      if (options.noparse) {
-        // Wrap body in the response object
-        if (typeof body === 'string') {
-          body = { body: body };
+      // Do the request
+      request(requestOptions, function (error, response, body) {
+        if (error) {
+          callback(error, response);
+          return;
         }
 
-        // Add location
-        const location = response.headers.Location || response.headers.location;
-
-        if (location) {
-          body.location = location;
+        if (
+          (Array.isArray(options.successStatusCodes)
+            && !options.successStatusCodes.includes(response.statusCode))
+          || (Array.isArray(options.failureStatusCodes)
+            && options.failureStatusCodes.includes(response.statusCode))
+        ) {
+          callback(
+            `Server returned unexpected status code: ${response.statusCode}`,
+            response
+          );
+          return;
         }
 
-        // Add status code
-        body.statusCode = response.statusCode;
+        if (options.noparse) {
+          // Wrap body in the response object
+          if (typeof body === 'string') {
+            body = { body: body };
+          }
 
-        callback(null, body);
-      } else {
-        tryParseJson(body, options.bodyProp, callback);
-      }
+          // Add location
+          const location
+            = response.headers.Location || response.headers.location;
+
+          if (location) {
+            body.location = location;
+          }
+
+          // Add status code
+          body.statusCode = response.statusCode;
+
+          callback(null, body);
+        } else {
+          tryParseJson(body, options.bodyProp, callback);
+        }
+      });
     });
   };
 
@@ -313,26 +378,34 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     build: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [BUILD_START, jobName],
-        successStatusCodes: [HTTP_CODE_201, HTTP_CODE_302],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [BUILD_START, jobName],
+          successStatusCodes: [HTTP_CODE_201, HTTP_CODE_302],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+
+          const queueIdRe = /\/queue\/item\/(\d+)/;
+          const id = +queueIdRe.exec(data.location)[1];
+
+          data.queueId = id;
+
+          callback(null, data);
         }
-
-        const queueIdRe = /\/queue\/item\/(\d+)/;
-        const id = +queueIdRe.exec(data.location)[1];
-
-        data.queueId = id;
-
-        callback(null, data);
-      });
+      );
     },
 
     /**
@@ -342,26 +415,34 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     build_with_params: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [BUILD_START_WITHPARAMS, jobName],
-        successStatusCodes: [HTTP_CODE_201, HTTP_CODE_302],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [BUILD_START_WITHPARAMS, jobName],
+          successStatusCodes: [HTTP_CODE_201, HTTP_CODE_302],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+
+          const queueIdRe = /\/queue\/item\/(\d+)/;
+          const id = +queueIdRe.exec(data.location)[1];
+
+          data.queueId = id;
+
+          callback(null, data);
         }
-
-        const queueIdRe = /\/queue\/item\/(\d+)/;
-        const id = +queueIdRe.exec(data.location)[1];
-
-        data.queueId = id;
-
-        callback(null, data);
-      });
+      );
     },
 
     /**
@@ -372,22 +453,31 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     stop_build: function (jobName, buildNumber, customParams, callback) {
-      [jobName, buildNumber, customParams, callback] = doArgs(arguments, ['string', 'string|number', ['object', {}], 'function']);
+      [jobName, buildNumber, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [BUILD_STOP, jobName, buildNumber],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [BUILD_STOP, jobName, buildNumber],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+
+          data.body = `Build ${buildNumber} stopped.`;
+
+          callback(null, data);
         }
-
-        data.body = `Build ${buildNumber} stopped.`;
-
-        callback(null, data);
-      });
+      );
     },
 
     /**
@@ -399,12 +489,21 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     console_output: function (jobName, buildNumber, customParams, callback) {
-      [jobName, buildNumber, customParams, callback] = doArgs(arguments, ['string', 'string|number', ['object', {}], 'function']);
+      [jobName, buildNumber, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [JOB_OUTPUT, jobName, buildNumber],
-        noparse: true
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [JOB_OUTPUT, jobName, buildNumber],
+          noparse: true
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -415,11 +514,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     last_build_info: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [LAST_BUILD, jobName]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [LAST_BUILD, jobName]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -430,11 +537,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     last_completed_build_info: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [LAST_COMPLETED_BUILD, jobName]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [LAST_COMPLETED_BUILD, jobName]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -446,11 +561,20 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     build_info: function (jobName, buildNumber, customParams, callback) {
-      [jobName, buildNumber, customParams, callback] = doArgs(arguments, ['string', 'string|number', ['object', {}], 'function']);
+      [jobName, buildNumber, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [BUILD_INFO, jobName, buildNumber]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [BUILD_INFO, jobName, buildNumber]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -462,13 +586,22 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     all_builds: function (jobName, param, customParams, callback) {
-      [jobName, param, customParams, callback] = doArgs(arguments, ['string', ['string', 'id,timestamp,result,duration'], ['object', {}], 'function']);
+      [jobName, param, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['string', 'id,timestamp,result,duration'],
+        ['object', {}],
+        'function'
+      ]);
 
       // TODO better name and handle the "param" ???
-      doRequest({
-        urlPattern: [ALL_BUILDS, jobName, param],
-        bodyProp: 'allBuilds'
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [ALL_BUILDS, jobName, param],
+          bodyProp: 'allBuilds'
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -480,11 +613,20 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     test_result: function (jobName, buildNumber, customParams, callback) {
-      [jobName, buildNumber, customParams, callback] = doArgs(arguments, ['string', 'string|number', ['object', {}], 'function']);
+      [jobName, buildNumber, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [TEST_REPORT, jobName, buildNumber]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [TEST_REPORT, jobName, buildNumber]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -512,20 +654,29 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     delete_build: function (jobName, buildNumber, customParams, callback) {
-      [jobName, buildNumber, customParams, callback] = doArgs(arguments, ['string', 'string|number', ['object', {}], 'function']);
+      [jobName, buildNumber, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [BUILD_DELETE, jobName, buildNumber],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-        } else {
-          data.body = `Build ${buildNumber} deleted.`;
-          callback(null, data);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [BUILD_DELETE, jobName, buildNumber],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+          } else {
+            data.body = `Build ${buildNumber} deleted.`;
+            callback(null, data);
+          }
         }
-      });
+      );
     },
 
     /** ***********************************\
@@ -539,12 +690,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     all_jobs: function (customParams, callback) {
-      [customParams, callback] = doArgs(arguments, [['object', {}], 'function']);
+      [customParams, callback] = doArgs(arguments, [
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [JOB_LIST],
-        bodyProp: 'jobs'
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [JOB_LIST],
+          bodyProp: 'jobs'
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -555,19 +713,27 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     get_config_xml: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [JOB_CONFIG, jobName],
-        noparse: true
-      }, customParams, function (error, data) {
-        // Get only the XML response body
-        if (error) {
-          callback(error, data);
-        } else {
-          callback(null, data.body);
+      doRequest(
+        {
+          urlPattern: [JOB_CONFIG, jobName],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          // Get only the XML response body
+          if (error) {
+            callback(error, data);
+          } else {
+            callback(null, data.body);
+          }
         }
-      });
+      );
     },
 
     /**
@@ -579,7 +745,12 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     update_config: function (jobName, modifyFunction, customParams, callback) {
-      [jobName, modifyFunction, customParams, callback] = doArgs(arguments, ['string', 'function', ['object', {}], 'function']);
+      [jobName, modifyFunction, customParams, callback] = doArgs(arguments, [
+        'string',
+        'function',
+        ['object', {}],
+        'function'
+      ]);
 
       const self = this;
 
@@ -605,25 +776,34 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     update_job: function (jobName, jobConfig, customParams, callback) {
-      [jobName, jobConfig, customParams, callback] = doArgs(arguments, ['string', 'string', ['object', {}], 'function']);
+      [jobName, jobConfig, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [JOB_CONFIG, jobName],
-        request: {
-          body: jobConfig,
-          headers: { 'Content-Type': 'application/xml' }
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [JOB_CONFIG, jobName],
+          request: {
+            body: jobConfig,
+            headers: { 'Content-Type': 'application/xml' }
+          },
+          noparse: true
         },
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          // TODO rather return job_info ???
+          // const data = {name: jobName, location: response.headers['Location'] || response.headers['location']};
+          callback(null, { name: jobName });
         }
-        // TODO rather return job_info ???
-        // const data = {name: jobName, location: response.headers['Location'] || response.headers['location']};
-        callback(null, { name: jobName });
-      });
+      );
     },
 
     /**
@@ -634,11 +814,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     job_info: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [JOB_INFO, jobName]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [JOB_INFO, jobName]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -650,28 +838,37 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     create_job: function (jobName, jobConfig, customParams, callback) {
-      [jobName, jobConfig, customParams, callback] = doArgs(arguments, ['string', 'string', ['object', {}], 'function']);
+      [jobName, jobConfig, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       // Set the created job name!
       customParams.name = jobName;
 
       const self = this;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [JOB_CREATE],
-        request: {
-          body: jobConfig,
-          headers: { 'Content-Type': 'application/xml' }
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [JOB_CREATE],
+          request: {
+            body: jobConfig,
+            headers: { 'Content-Type': 'application/xml' }
+          },
+          noparse: true
         },
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          self.job_info(jobName, customParams, callback);
         }
-        self.job_info(jobName, customParams, callback);
-      });
+      );
     },
 
     /**
@@ -684,8 +881,17 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {object|undefined} customParams is optional
      * @param {function} callback
      */
-    copy_job: function (jobName, newJobName, modifyFunction, customParams, callback) {
-      [jobName, newJobName, modifyFunction, customParams, callback] = doArgs(arguments, ['string', 'string', 'function', ['object', {}], 'function']);
+    copy_job: function (
+      jobName,
+      newJobName,
+      modifyFunction,
+      customParams,
+      callback
+    ) {
+      [jobName, newJobName, modifyFunction, customParams, callback] = doArgs(
+        arguments,
+        ['string', 'string', 'function', ['object', {}], 'function']
+      );
 
       const self = this;
 
@@ -710,19 +916,27 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     delete_job: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [JOB_DELETE, jobName],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [JOB_DELETE, jobName],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          callback(null, { name: jobName });
         }
-        callback(null, { name: jobName });
-      });
+      );
     },
 
     /**
@@ -733,21 +947,29 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     disable_job: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       const self = this;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [JOB_DISABLE, jobName],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [JOB_DISABLE, jobName],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          self.job_info(jobName, customParams, callback);
         }
-        self.job_info(jobName, customParams, callback);
-      });
+      );
     },
 
     /**
@@ -758,21 +980,29 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     enable_job: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       const self = this;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [JOB_ENABLE, jobName],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [JOB_ENABLE, jobName],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          self.job_info(jobName, customParams, callback);
         }
-        self.job_info(jobName, customParams, callback);
-      });
+      );
     },
 
     /**
@@ -783,12 +1013,20 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     last_success: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [LAST_SUCCESS, jobName]
-      }, customParams, callback);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [LAST_SUCCESS, jobName]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -799,7 +1037,11 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     last_result: function (jobName, customParams, callback) {
-      [jobName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       this.job_info(jobName, function (error, data) {
         if (error) {
@@ -809,9 +1051,13 @@ exports.init = function (host, defaultOptions, defaultParams) {
 
         const lastResultUrl = data.lastBuild.url;
 
-        doRequest({
-          urlPattern: [lastResultUrl + API, jobName]
-        }, customParams, callback);
+        doRequest(
+          {
+            urlPattern: [lastResultUrl + API, jobName]
+          },
+          customParams,
+          callback
+        );
       });
     },
 
@@ -826,11 +1072,18 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     queue: function (customParams, callback) {
-      [customParams, callback] = doArgs(arguments, [['object', {}], 'function']);
+      [customParams, callback] = doArgs(arguments, [
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [QUEUE]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [QUEUE]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -841,11 +1094,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     queue_item: function (queueNumber, customParams, callback) {
-      [queueNumber, customParams, callback] = doArgs(arguments, ['string|number', ['object', {}], 'function']);
+      [queueNumber, customParams, callback] = doArgs(arguments, [
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [QUEUE_ITEM, queueNumber]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [QUEUE_ITEM, queueNumber]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -856,14 +1117,22 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     cancel_item: function (itemId, customParams, callback) {
-      [itemId, customParams, callback] = doArgs(arguments, ['string|number', ['object', {}], 'function']);
+      [itemId, customParams, callback] = doArgs(arguments, [
+        'string|number',
+        ['object', {}],
+        'function'
+      ]);
 
       customParams.id = itemId;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [QUEUE_CANCEL_ITEM]
-      }, customParams, callback);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [QUEUE_CANCEL_ITEM]
+        },
+        customParams,
+        callback
+      );
     },
 
     /** ***********************************\
@@ -877,11 +1146,18 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     computers: function (customParams, callback) {
-      [customParams, callback] = doArgs(arguments, [['object', {}], 'function']);
+      [customParams, callback] = doArgs(arguments, [
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [COMPUTERS]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [COMPUTERS]
+        },
+        customParams,
+        callback
+      );
     },
 
     /** ***********************************\
@@ -895,12 +1171,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     all_views: function (customParams, callback) {
-      [customParams, callback] = doArgs(arguments, [['object', {}], 'function']);
+      [customParams, callback] = doArgs(arguments, [
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [VIEW_LIST],
-        bodyProp: 'views'
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [VIEW_LIST],
+          bodyProp: 'views'
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -911,7 +1194,12 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     create_view: function (viewName, mode, customParams, callback) {
-      [viewName, mode, customParams, callback] = doArgs(arguments, ['string', ['string', 'hudson.model.ListView'], ['object', {}], 'function']);
+      [viewName, mode, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['string', 'hudson.model.ListView'],
+        ['object', {}],
+        'function'
+      ]);
 
       const formData = { name: viewName, mode: mode };
 
@@ -919,20 +1207,24 @@ exports.init = function (host, defaultOptions, defaultParams) {
 
       const self = this;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [VIEW_CREATE],
-        request: {
-          form: formData
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [VIEW_CREATE],
+          request: {
+            form: formData
+          },
+          noparse: true
         },
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          self.view_info(viewName, customParams, callback);
         }
-        self.view_info(viewName, customParams, callback);
-      });
+      );
     },
 
     /**
@@ -941,11 +1233,19 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     view_info: function (viewName, customParams, callback) {
-      [viewName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [viewName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [VIEW_INFO, viewName]
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [VIEW_INFO, viewName]
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -957,27 +1257,36 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     update_view: function (viewName, viewConfig, customParams, callback) {
-      [viewName, viewConfig, customParams, callback] = doArgs(arguments, ['string', 'object', ['object', {}], 'function']);
+      [viewName, viewConfig, customParams, callback] = doArgs(arguments, [
+        'string',
+        'object',
+        ['object', {}],
+        'function'
+      ]);
 
       viewConfig.json = JSON.stringify(viewConfig);
 
       const self = this;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [VIEW_CONFIG, viewName],
-        request: {
-          form: viewConfig
-          // headers: {'content-type': 'application/x-www-form-urlencoded'},
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [VIEW_CONFIG, viewName],
+          request: {
+            form: viewConfig
+            // headers: {'content-type': 'application/x-www-form-urlencoded'},
+          },
+          noparse: true
         },
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          self.view_info(viewName, customParams, callback);
         }
-        self.view_info(viewName, customParams, callback);
-      });
+      );
     },
 
     /**
@@ -986,19 +1295,27 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     delete_view: function (viewName, customParams, callback) {
-      [viewName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [viewName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [VIEW_DELETE, viewName],
-        noparse: true
-      }, customParams, function (error, data) {
-        if (error) {
-          callback(error, data);
-          return;
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [VIEW_DELETE, viewName],
+          noparse: true
+        },
+        customParams,
+        function (error, data) {
+          if (error) {
+            callback(error, data);
+            return;
+          }
+          callback(null, { name: viewName });
         }
-        callback(null, { name: viewName });
-      });
+      );
     },
 
     /**
@@ -1008,15 +1325,24 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     add_job_to_view: function (viewName, jobName, customParams, callback) {
-      [viewName, jobName, customParams, callback] = doArgs(arguments, ['string', 'string', ['object', {}], 'function']);
+      [viewName, jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       customParams.name = jobName;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [VIEW_ADD_JOB, viewName],
-        noparse: true
-      }, customParams, callback);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [VIEW_ADD_JOB, viewName],
+          noparse: true
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -1026,15 +1352,24 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     remove_job_from_view: function (viewName, jobName, customParams, callback) {
-      [viewName, jobName, customParams, callback] = doArgs(arguments, ['string', 'string', ['object', {}], 'function']);
+      [viewName, jobName, customParams, callback] = doArgs(arguments, [
+        'string',
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       customParams.name = jobName;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [VIEW_REMOVE_JOB, viewName],
-        noparse: true
-      }, customParams, callback);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [VIEW_REMOVE_JOB, viewName],
+          noparse: true
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -1045,12 +1380,20 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     all_jobs_in_view: function (viewName, customParams, callback) {
-      [viewName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [viewName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
-      doRequest({
-        urlPattern: [VIEW_INFO, viewName],
-        bodyProp: 'jobs'
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [VIEW_INFO, viewName],
+          bodyProp: 'jobs'
+        },
+        customParams,
+        callback
+      );
     },
 
     /** ***********************************\
@@ -1064,16 +1407,23 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     all_installed_plugins: function (customParams, callback) {
-      [customParams, callback] = doArgs(arguments, [['object', {}], 'function']);
+      [customParams, callback] = doArgs(arguments, [
+        ['object', {}],
+        'function'
+      ]);
 
       customParams.depth = 1;
 
-      doRequest({
-        urlPattern: [PLUGINS],
-        failureStatusCodes: [HTTP_CODE_302],
-        noparse: true,
-        bodyProp: 'plugins'
-      }, customParams, callback);
+      doRequest(
+        {
+          urlPattern: [PLUGINS],
+          failureStatusCodes: [HTTP_CODE_302],
+          noparse: true,
+          bodyProp: 'plugins'
+        },
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -1084,20 +1434,28 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     install_plugin: function (pluginName, customParams, callback) {
-      [pluginName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [pluginName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       const body = `<jenkins><install plugin="${pluginName}" /></jenkins>`;
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [INSTALL_PLUGIN],
-        request: {
-          body: body,
-          headers: { 'Content-Type': 'text/xml' }
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [INSTALL_PLUGIN],
+          request: {
+            body: body,
+            headers: { 'Content-Type': 'text/xml' }
+          },
+          noparse: true,
+          bodyProp: 'plugins'
         },
-        noparse: true,
-        bodyProp: 'plugins'
-      }, customParams, callback);
+        customParams,
+        callback
+      );
     },
 
     /**
@@ -1112,7 +1470,11 @@ exports.init = function (host, defaultOptions, defaultParams) {
      * @param {function} callback
      */
     create_folder: function (folderName, customParams, callback) {
-      [folderName, customParams, callback] = doArgs(arguments, ['string', ['object', {}], 'function']);
+      [folderName, customParams, callback] = doArgs(arguments, [
+        'string',
+        ['object', {}],
+        'function'
+      ]);
 
       const mode = 'com.cloudbees.hudson.plugins.folder.Folder';
 
@@ -1120,10 +1482,14 @@ exports.init = function (host, defaultOptions, defaultParams) {
       customParams.mode = mode;
       customParams.Submit = 'OK';
 
-      doRequest({
-        method: 'POST',
-        urlPattern: [NEWFOLDER]
-      }, customParams, callback);
+      doRequest(
+        {
+          method: 'POST',
+          urlPattern: [NEWFOLDER]
+        },
+        customParams,
+        callback
+      );
     }
   };
 };
